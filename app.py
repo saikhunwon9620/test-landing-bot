@@ -79,7 +79,7 @@ def generate_reply(psid: str, text: str) -> str:
             "parts": [{"text": SYSTEM_PROMPT.format(kb=load_knowledge())}]
         },
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": 500, "temperature": 0.7},
+        "generationConfig": {"maxOutputTokens": 1500, "temperature": 0.7},
     }
     r = requests.post(
         GEMINI_URL, params={"key": GEMINI_API_KEY}, json=payload, timeout=60
