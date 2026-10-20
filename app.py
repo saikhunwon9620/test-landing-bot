@@ -6,13 +6,9 @@ Flow:
 Guided deposit flow (simple state machine, stored on disk so it survives
 across gunicorn workers in the same container):
   customer says deposit intent -> bot asks payment type (KPay / Wave Pay)
-  -> bot sends that method's QR code image + account number
+  -> bot sends that method's account number as text
   -> customer sends slip image -> bot asks the amount -> transaction logged
   -> staff can review recent deposits at GET /deposits?token=<ADMIN_TOKEN>
-
-QR images live in the qr/ folder next to this file (qr/kpay.png, qr/wave.png)
-and are served at /qr/<file>. If a QR file is missing the bot still sends the
-account number as text.
 
 Environment variables:
   VERIFY_TOKEN        - any secret string you choose; must match the token you
@@ -23,7 +19,6 @@ Environment variables:
   GEMINI_MODEL        - model id (default: gemini-3.5-flash)
   KPAY_NUMBER         - KPay account shown to customers (default below)
   WAVEPAY_NUMBER      - Wave Pay account shown to customers (default below)
-  PUBLIC_BASE_URL     - public base URL of this service (for QR image links)
   ADMIN_TOKEN         - token for GET /deposits (default: VERIFY_TOKEN)
   PORT                - listen port (default: 8000)
 """
@@ -37,7 +32,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 import requests
-from flask import Flask, request, send_from_directory
+from flask import Flask, request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("test-landing-bot")
@@ -46,11 +41,9 @@ VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 PAGE_TOKEN = os.environ["PAGE_ACCESS_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
-KPAY_NUMBER = os.environ.get("KPAY_NUMBER", "09946946294")
+KPAY_NUMBER = os.environ.get("KPAY_NUMBER", "09777888999")
 WAVEPAY_NUMBER = os.environ.get("WAVEPAY_NUMBER", "09946946294")
-PUBLIC_BASE_URL = os.environ.get(
-    "PUBLIC_BASE_URL", "https://test-landing-bot-production-b590.up.railway.app"
-).rstrip("/")
+MIN_DEPOSIT = 10000  # kyats; business rule from the FAQ (2026-10-20)
 
 app = Flask(__name__)
 
@@ -73,7 +66,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 STATE_FILE = os.path.join(DATA_DIR, "deposit_state.json")
 TXN_FILE = os.path.join(DATA_DIR, "transactions.jsonl")
-QR_DIR = os.path.join(BASE_DIR, "qr")
 
 
 def load_knowledge() -> str:
@@ -145,28 +137,6 @@ def send_to_messenger(psid: str, text: str) -> None:
             return
 
 
-def send_image(psid: str, url: str) -> None:
-    try:
-        r = requests.post(
-            GRAPH_URL,
-            params={"access_token": PAGE_TOKEN},
-            json={
-                "recipient": {"id": psid},
-                "message": {
-                    "attachment": {
-                        "type": "image",
-                        "payload": {"url": url, "is_reusable": True},
-                    }
-                },
-            },
-            timeout=15,
-        )
-        if r.status_code != 200:
-            log.error("image send failed %s: %s", r.status_code, r.text[:300])
-    except requests.RequestException:
-        log.exception("image send request failed")
-
-
 # --------------------------------------------------------------------------
 # Deposit flow
 # --------------------------------------------------------------------------
@@ -175,13 +145,13 @@ PAYMENT_TYPES = {
     "kpay": {
         "label": "KPay",
         "number": KPAY_NUMBER,
-        "qr_file": "kpay.png",
+        "name": "Min Min Oo",
         "keywords": ("kpay", "k pay", "kbzpay", "kbz pay", "ကေပေး"),
     },
     "wave": {
         "label": "Wave Pay",
         "number": WAVEPAY_NUMBER,
-        "qr_file": "wave.png",
+        "name": None,
         "keywords": ("wave", "wavepay", "wave pay", "ဝေ့ဗ်"),
     },
 }
@@ -259,18 +229,16 @@ def detect_pay_type(text: str):
     return None
 
 
-def send_qr(psid: str, ptype: str, state: dict) -> bool:
-    """Send the chosen method's QR image + account number; wait for the slip."""
+def send_payment_details(psid: str, ptype: str, state: dict) -> bool:
+    """Send the chosen method's account details as text; wait for the slip."""
     info = PAYMENT_TYPES[ptype]
     state[psid] = {"step": "slip", "pay_type": ptype}
     _save_state(state)
-    if os.path.exists(os.path.join(QR_DIR, info["qr_file"])):
-        send_image(psid, f"{PUBLIC_BASE_URL}/qr/{info['qr_file']}")
+    name_line = f" ({info['name']})" if info.get("name") else ""
     send_to_messenger(
         psid,
-        f"{info['label']} အကောင့်: {info['number']}\n"
-        "QR ကို scan ပြီး လွှဲလို့လည်း ရပါတယ်။ "
-        "လွှဲပြီးရင် slip ပုံကို ဒီမှာ ပြန်ပို့ပေးပါနော် 📸",
+        f"{info['label']} အကောင့်: {info['number']}{name_line}\n"
+        "ငွေလွှဲပြီးရင် slip ပုံကို ဒီမှာ ပြန်ပို့ပေးပါနော် 📸",
     )
     return True
 
@@ -303,12 +271,12 @@ def _check_amount(psid: str, text: str, state: dict):
     st = state[psid]
     amount = parse_amount(text)
     if amount is None:
-        send_to_messenger(psid, "ပမာဏကို နံပါတ်နဲ့ ပို့ပေးပါနော် (ဥပမာ 5000) 🙏")
+        send_to_messenger(psid, "ပမာဏကို နံပါတ်နဲ့ ပို့ပေးပါနော် (ဥပမာ 10000) 🙏")
         return True
-    if amount < 2000:
+    if amount < MIN_DEPOSIT:
         send_to_messenger(
             psid,
-            "အနည်းဆုံး ၂၀၀၀ ကျပ်ကနေ စသွင်းလို့ရပါတယ်ရှင့်။ "
+            "အနည်းဆုံး ၁၀,၀၀၀ ကျပ်ကနေ စသွင်းလို့ရပါတယ်ရှင့်။ "
             "ပမာဏ ပြန်ပို့ပေးပါနော် 🙏",
         )
         return True
@@ -316,7 +284,7 @@ def _check_amount(psid: str, text: str, state: dict):
         send_to_messenger(
             psid,
             "ယူနစ်က ၁ ယူနစ် = ၁၀၀၀ ကျပ် နှုန်းမို့ ၁၀၀၀ နဲ့ စားလို့ပြတ်တဲ့ "
-            "ပမာဏလေး ပြန်ပို့ပေးပါနော် (ဥပမာ 5000, 10000) 🙏",
+            "ပမာဏလေး ပြန်ပို့ပေးပါနော် (ဥပမာ 10000, 20000) 🙏",
         )
         return True
     st["amount"] = amount
@@ -346,14 +314,14 @@ def handle_deposit_text(psid: str, text: str, state: dict) -> bool:
     if not st:
         if wants_deposit(text):
             if ptype:  # e.g. "KPay နဲ့ ငွေသွင်းချင်တယ်" — type already known
-                return send_qr(psid, ptype, state)
+                return send_payment_details(psid, ptype, state)
             state[psid] = {"step": "paytype"}
             _save_state(state)
             send_to_messenger(
                 psid,
                 "ဘယ် payment အမျိုးအစားနဲ့ ငွေသွင်းချင်ပါသလဲရှင့်။ "
                 "KPay, Wave Pay စသည့် ငွေပေးချေမှု အမျိုးအစားတွေနဲ့ "
-                "ပေးသွင်းနိုင်ပါတယ်။",
+                "ပေးသွင်းနိုင်ပါတယ်။ အနည်းဆုံး ၁၀,၀၀၀ ကျပ်က စသွင်းနိုင်ပါတယ်။",
             )
             return True
         return False
@@ -361,7 +329,7 @@ def handle_deposit_text(psid: str, text: str, state: dict) -> bool:
     step = st.get("step")
     if step == "paytype":
         if ptype:
-            return send_qr(psid, ptype, state)
+            return send_payment_details(psid, ptype, state)
         send_to_messenger(
             psid,
             "ငွေသွင်းဖို့ KPay လား, Wave Pay လား ရွေးပေးပါနော် 🙏 "
@@ -397,7 +365,7 @@ def handle_image(psid: str, state: dict) -> None:
     send_to_messenger(
         psid,
         "Slip ပုံ လက်ခံရရှိပါပြီ 📸 သွင်းခဲ့တဲ့ ပမာဏလေးကို "
-        "နံပါတ်နဲ့ ပို့ပေးပါနော် (ဥပမာ 5000)",
+        "နံပါတ်နဲ့ ပို့ပေးပါနော် (ဥပမာ 10000)",
     )
 
 
@@ -456,14 +424,6 @@ def incoming():
         for ev in entry.get("messaging", []):
             handle_event(ev)
     return "ok", 200
-
-
-@app.get("/qr/<path:name>")
-def qr_file(name: str):
-    """Serve a payment QR image (only the known payment-method files)."""
-    if name not in ("kpay.png", "wave.png"):
-        return "not found", 404
-    return send_from_directory(QR_DIR, name)
 
 
 @app.get("/deposits")
