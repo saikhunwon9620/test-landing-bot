@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import html as html_lib
 import json
+import uuid
 from urllib.parse import quote
 import logging
 import os
@@ -40,7 +41,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 import requests
-from flask import Flask, redirect, request
+from flask import Flask, redirect, request, send_from_directory
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("test-landing-bot")
@@ -84,6 +85,8 @@ VIBER_STATE_FILE = os.path.join(DATA_DIR, "viber_deposit_state.json")
 INBOX_FILE = os.path.join(DATA_DIR, "inbox.jsonl")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 PAUSED_FILE = os.path.join(DATA_DIR, "paused.json")
+MEDIA_DIR = os.path.join(DATA_DIR, "media")
+MAX_UPLOAD = 25 * 1024 * 1024  # 25 MB staff-upload cap
 
 
 def load_knowledge() -> str:
@@ -159,12 +162,16 @@ def _write_json(path, data) -> None:
 
 
 def log_message(channel, user_id, direction, text, by="bot", kind="text",
-                name=None) -> None:
+                name=None, media=None, fname=None) -> None:
     rec = {
         "channel": channel, "user_id": user_id, "dir": direction,
         "text": text, "by": by, "kind": kind,
         "time": datetime.now().isoformat(timespec="seconds"),
     }
+    if media:
+        rec["media"] = media
+    if fname:
+        rec["fname"] = fname
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(INBOX_FILE, "a", encoding="utf-8") as f:
@@ -543,10 +550,32 @@ def _viber_save_state(state: dict) -> None:
         log.exception("could not save viber deposit state")
 
 
+def _viber_deliver(payload) -> bool:
+    """POST a send_message payload; True only when Viber's body says
+    status 0 (HTTP 200 alone is not proof of delivery)."""
+    try:
+        r = requests.post(
+            f"{VIBER_API}/send_message",
+            headers={"X-Viber-Auth-Token": VIBER_TOKEN},
+            json=payload,
+            timeout=20,
+        )
+    except requests.RequestException:
+        log.exception("viber send request failed")
+        return False
+    ok = False
+    if r.status_code == 200:
+        try:
+            ok = r.json().get("status") == 0
+        except ValueError:
+            ok = False
+    if not ok:
+        log.error("viber send NOT delivered %s: %s", r.status_code, r.text[:300])
+    return ok
+
+
 def viber_send(user_id: str, text: str, keyboard=None, by="bot") -> bool:
-    """Send a Viber message. True only when Viber confirms delivery —
-    the API answers HTTP 200 with {"status": != 0} for failures such as
-    an unknown or unsubscribed receiver, so the body must be checked."""
+    """Send a Viber text message; logs it when Viber confirms delivery."""
     if not VIBER_TOKEN:
         log.error("VIBER_AUTH_TOKEN not set; cannot send Viber message")
         return False
@@ -559,27 +588,58 @@ def viber_send(user_id: str, text: str, keyboard=None, by="bot") -> bool:
     }
     if keyboard:
         payload["keyboard"] = keyboard
+    if _viber_deliver(payload):
+        log_message("viber", user_id, "out", text, by=by)
+        return True
+    return False
+
+
+def viber_send_media(user_id, url, fname, size, is_image, by="staff") -> bool:
+    """Send a Viber picture/file message pointing at a hosted URL."""
+    if not VIBER_TOKEN:
+        return False
+    payload = {
+        "receiver": user_id,
+        "min_api_version": 7,
+        "sender": {"name": VIBER_BOT_NAME},
+    }
+    if is_image:
+        payload.update({"type": "picture", "media": url, "thumbnail": url})
+    else:
+        payload.update({"type": "file", "media": url, "size": size,
+                        "file_name": fname})
+    if _viber_deliver(payload):
+        log_message("viber", user_id, "out",
+                    "(ပုံ)" if is_image else f"(ဖိုင်: {fname})",
+                    by=by, kind="image" if is_image else "file",
+                    media=url, fname=fname)
+        return True
+    return False
+
+
+def _post_messenger_media(psid, url, is_image) -> bool:
+    """Send a Messenger image/file attachment by public URL."""
+    payload = {
+        "attachment": {
+            "type": "image" if is_image else "file",
+            "payload": {"url": url, "is_reusable": True},
+        }
+    }
     try:
         r = requests.post(
-            f"{VIBER_API}/send_message",
-            headers={"X-Viber-Auth-Token": VIBER_TOKEN},
-            json=payload,
-            timeout=15,
+            GRAPH_URL,
+            params={"access_token": PAGE_TOKEN},
+            json={"recipient": {"id": psid}, "message": payload},
+            timeout=20,
         )
     except requests.RequestException:
-        log.exception("viber send request failed")
+        log.exception("messenger media send failed")
         return False
-    ok = False
-    if r.status_code == 200:
-        try:
-            ok = r.json().get("status") == 0
-        except ValueError:
-            ok = False
-    if ok:
-        log_message("viber", user_id, "out", text, by=by)
-    else:
-        log.error("viber send NOT delivered %s: %s", r.status_code, r.text[:300])
-    return ok
+    if r.status_code != 200:
+        log.error("messenger media NOT delivered %s: %s",
+                  r.status_code, r.text[:300])
+        return False
+    return True
 
 
 def _paytype_keyboard() -> dict:
@@ -626,11 +686,17 @@ def handle_event(ev: dict) -> None:
 
     state = _load_state()
     attachments = msg.get("attachments") or []
-    if any(a.get("type") == "image" for a in attachments):
-        log_message("messenger", psid, "in", "(ပုံ)", kind="image")
+    img = next((a for a in attachments if a.get("type") == "image"), None)
+    fil = next((a for a in attachments if a.get("type") == "file"), None)
+    if img or fil:
+        att = img or fil
+        url = (att.get("payload") or {}).get("url")
+        kind = "image" if img else "file"
+        log_message("messenger", psid, "in", "(ပုံ)" if img else "(ဖိုင်)",
+                    kind=kind, media=url)
         if is_paused("messenger", psid):
             return  # staff is handling this customer; stay silent
-        handle_image(psid, state)
+        handle_image(psid, state)  # slip handling (image or file)
         return
     if "text" not in msg:
         return  # ignore stickers, locations, etc. for now
@@ -729,9 +795,16 @@ def viber_webhook():
         if sender:
             if msg.get("type") == "picture":
                 log_message("viber", sender, "in", "(ပုံ)", kind="image",
-                            name=sname)
+                            name=sname, media=msg.get("media"))
                 if not is_paused("viber", sender):
                     viber_deposit_image(sender)
+            elif msg.get("type") == "file":
+                fname = msg.get("file_name") or "ဖိုင်"
+                log_message("viber", sender, "in", f"(ဖိုင်: {fname})",
+                            kind="file", name=sname,
+                            media=msg.get("media"), fname=fname)
+                if not is_paused("viber", sender):
+                    viber_deposit_image(sender)  # a file can be the slip too
             elif msg.get("type") == "text":
                 text = (msg.get("text") or "").strip()
                 if text:
@@ -880,9 +953,18 @@ def inbox_chat():
             cls += " staff"
         by = {"bot": "🤖 Bot", "staff": "🧑‍💼 Staff"}.get(r.get("by"), "")
         label = name if r["dir"] == "in" else by
+        extra = ""
+        if r.get("media"):
+            if r.get("kind") == "image":
+                extra = (f"<br><img src='{html_lib.escape(r['media'])}' "
+                         f"style='max-width:230px;border-radius:8px'>")
+            else:
+                extra = (f"<br><a href='{html_lib.escape(r['media'])}' "
+                         f"target='_blank'>📎 "
+                         f"{html_lib.escape(r.get('fname') or 'ဖိုင်')}</a>")
         bubbles += (
             f"<div class='row {cls}'><div class='msg {cls}'>"
-            f"{html_lib.escape(r['text'])}"
+            f"{html_lib.escape(r['text'])}{extra}"
             f"<div class='t'>{html_lib.escape(label)} · {r['time']}</div>"
             f"</div></div>"
         )
@@ -904,17 +986,44 @@ def inbox_chat():
         f"{'<p>⏸ <b>Bot ရပ်ထားသည်</b> — ဝန်ထမ်း ပြောနေချိန် bot က ပြန်မဖြေပါ</p>' if paused else ''}"
         f"{bubbles or '<p>စာ မရှိသေးပါ</p>'}"
         f"<div class='replybar'>"
-        f"<form method='post' action='/inbox/reply'>"
+        f"<form method='post' action='/inbox/reply' enctype='multipart/form-data'>"
         f"<input type='hidden' name='token' value='{token}'>"
         f"<input type='hidden' name='channel' value='{channel}'>"
         f"<input type='hidden' name='user' value='{user_id}'>"
         f"<textarea name='text' rows='3' placeholder='ပြန်စာ ရေးပါ...'></textarea>"
+        f"<p>📎 ပုံ/ဖိုင် တွဲပို့ရန်: <input type='file' name='file'></p>"
         f"<p><button type='submit'>📤 ပို့မယ်</button></p></form>"
         f"{pbtn}"
         f"</div>"
         f"<p><a href='/inbox/chat?token={token}&channel={channel}&user={quote(user_id, safe='')}'>↻ Refresh</a></p>"
     )
     return _page(f"Chat — {name}", body)
+
+
+def _save_upload(file_storage):
+    """Save a staff upload under a UUID name; returns (name, size) or
+    (None, 0) when it exceeds the size cap."""
+    orig = file_storage.filename or "file"
+    ext = os.path.splitext(orig)[1].lower()[:6]
+    if not re.fullmatch(r"\.[a-z0-9]+", ext or ""):
+        ext = ".bin"
+    name = f"{uuid.uuid4()}{ext}"
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    path = os.path.join(MEDIA_DIR, name)
+    file_storage.save(path)
+    size = os.path.getsize(path)
+    if size > MAX_UPLOAD:
+        os.remove(path)
+        return None, 0
+    return name, size
+
+
+@app.get("/media/<name>")
+def media_file(name):
+    """Serve a staff-uploaded file (UUID names only)."""
+    if not re.fullmatch(r"[a-f0-9-]{36}\.[a-z0-9]{1,6}", name):
+        return "not found", 404
+    return send_from_directory(MEDIA_DIR, name)
 
 
 @app.post("/inbox/reply")
@@ -925,16 +1034,42 @@ def inbox_reply():
     channel = request.form.get("channel", "")
     user_id = request.form.get("user", "")
     text = (request.form.get("text") or "").strip()
-    sent = False
-    if channel and user_id and text:
-        if channel == "viber":
-            sent = viber_send(user_id, text, by="staff")
-        elif _post_messenger(user_id, text):
-            log_message("messenger", user_id, "out", text, by="staff")
-            sent = True
+    upload = request.files.get("file")
+    has_file = upload is not None and bool(upload.filename)
+    results = []
+    if channel and user_id and (text or has_file):
+        if has_file:
+            saved, size = _save_upload(upload)
+            if saved:
+                url = f"{PUBLIC_BASE_URL}/media/{saved}"
+                is_image = (upload.mimetype or "").startswith("image/")
+                fname = upload.filename or saved
+                if channel == "viber":
+                    results.append(
+                        viber_send_media(user_id, url, fname, size, is_image))
+                else:
+                    ok = _post_messenger_media(user_id, url, is_image)
+                    if ok:
+                        log_message(
+                            "messenger", user_id, "out",
+                            "(ပုံ)" if is_image else f"(ဖိုင်: {fname})",
+                            by="staff",
+                            kind="image" if is_image else "file",
+                            media=url, fname=fname)
+                    results.append(ok)
+            else:
+                results.append(False)  # too large
+        if text:
+            if channel == "viber":
+                results.append(viber_send(user_id, text, by="staff"))
+            elif _post_messenger(user_id, text):
+                log_message("messenger", user_id, "out", text, by="staff")
+                results.append(True)
+            else:
+                results.append(False)
     back = (f"/inbox/chat?token={token}&channel={channel}"
             f"&user={quote(user_id, safe='')}")
-    if text and not sent:
+    if (text or has_file) and not (results and all(results)):
         back += "&err=1"
     return redirect(back)
 
