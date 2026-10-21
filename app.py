@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import html as html_lib
 import json
+import threading
 import uuid
 from urllib.parse import quote
 import logging
@@ -86,6 +87,24 @@ INBOX_FILE = os.path.join(DATA_DIR, "inbox.jsonl")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 PAUSED_FILE = os.path.join(DATA_DIR, "paused.json")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
+
+_inbox_lock = threading.Lock()
+_inbox_seq = [None]
+
+
+def _init_seq():
+    if _inbox_seq[0] is None:
+        _inbox_seq[0] = 0
+        try:
+            with open(INBOX_FILE, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        _inbox_seq[0] = max(
+                            _inbox_seq[0], json.loads(line).get("seq", 0))
+                    except ValueError:
+                        pass
+        except FileNotFoundError:
+            pass
 MAX_UPLOAD = 25 * 1024 * 1024  # 25 MB staff-upload cap
 
 
@@ -166,7 +185,7 @@ def log_message(channel, user_id, direction, text, by="bot", kind="text",
     rec = {
         "channel": channel, "user_id": user_id, "dir": direction,
         "text": text, "by": by, "kind": kind,
-        "time": datetime.now().isoformat(timespec="seconds"),
+        "time": datetime.now().isoformat(timespec="milliseconds"),
     }
     if media:
         rec["media"] = media
@@ -174,8 +193,12 @@ def log_message(channel, user_id, direction, text, by="bot", kind="text",
         rec["fname"] = fname
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        with open(INBOX_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        with _inbox_lock:
+            _init_seq()
+            _inbox_seq[0] += 1
+            rec["seq"] = _inbox_seq[0]
+            with open(INBOX_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         log.exception("could not log inbox message")
     if name:
@@ -892,11 +915,8 @@ def _page(title, body, refresh=False):
     )
 
 
-@app.get("/inbox")
-def inbox_list():
-    token = request.args.get("token", "")
-    if not _staff_ok(token):
-        return "forbidden", 403
+def _conv_summaries():
+    """Conversation list data shared by the inbox page and its JSON API."""
     convs = {}
     for rec in _read_inbox():
         key = f"{rec['channel']}:{rec['user_id']}"
@@ -906,20 +926,129 @@ def inbox_list():
         c["count"] += 1
     ordered = sorted(convs.values(),
                      key=lambda c: c["last"]["time"], reverse=True)
-    rows = ""
     for c in ordered:
+        c["name"] = user_name(c["channel"], c["user_id"])
+        c["paused"] = is_paused(c["channel"], c["user_id"])
+    return ordered
+
+
+@app.get("/inbox/api/conversations")
+def inbox_api_conversations():
+    if not _staff_ok(request.args.get("token", "")):
+        return {"error": "forbidden"}, 403
+    return _conv_summaries()
+
+
+@app.get("/inbox/api/thread")
+def inbox_api_thread():
+    if not _staff_ok(request.args.get("token", "")):
+        return {"error": "forbidden"}, 403
+    channel = request.args.get("channel", "")
+    user_id = request.args.get("user", "")
+    try:
+        after = int(request.args.get("after", "0"))
+    except ValueError:
+        after = 0
+    msgs = [r for r in _read_inbox()
+            if r["channel"] == channel and r["user_id"] == user_id
+            and r.get("seq", 0) > after]
+    return msgs[-100:]
+
+
+_SOUND_BTN = ("<p><button type='button' id='sndbtn' "
+              "onclick='toggleSound()'>🔔 အသံ: ပိတ်</button></p>")
+
+_LIST_JS = """
+<script>
+const TOKEN=new URLSearchParams(location.search).get('token');
+let lastIncoming=null, soundOn=false, actx=null;
+function esc(s){const d=document.createElement('div');d.textContent=(s==null?'':s);return d.innerHTML}
+function toggleSound(){soundOn=!soundOn;if(soundOn){try{actx=new (window.AudioContext||window.webkitAudioContext)();actx.resume();}catch(e){}}document.getElementById('sndbtn').textContent=soundOn?'🔔 အသံ: ဖွင့်':'🔔 အသံ: ပိတ်';}
+function beep(){if(!soundOn||!actx)return;try{const o=actx.createOscillator(),g=actx.createGain();o.connect(g);g.connect(actx.destination);o.frequency.value=880;g.gain.setValueAtTime(0.08,actx.currentTime);o.start();o.stop(actx.currentTime+0.15);}catch(e){}}
+function render(convs){
+  const el=document.getElementById('convs');
+  if(!convs.length){el.innerHTML="<div class='card'>စကားဝိုင်း မရှိသေးပါ</div>";return;}
+  el.innerHTML=convs.map(c=>{
+    const badge=c.channel==='messenger'?"<span class='badge fb'>Messenger</span>":"<span class='badge vb'>Viber</span>";
+    const p=c.paused?" <span class='badge paused'>⏸ bot ရပ်ထား</span>":"";
+    const who=c.last.dir==='in'?'👤 ':'🤖 ';
+    return "<a class='conv' href='/inbox/chat?token="+TOKEN+"&channel="+c.channel+"&user="+encodeURIComponent(c.user_id)+"'><div class='card'><b>"+esc(c.name)+"</b> "+badge+p+"<div class='t'>"+c.last.time+" · "+c.count+" messages</div><div>"+who+esc((c.last.text||'').slice(0,150))+"</div><div class='t'>💬 နှိပ်ပြီး အပြည့်ဖတ် / ပြန်ရေးရန်</div></div></a>";
+  }).join('');
+}
+async function poll(){
+  try{
+    const r=await fetch('/inbox/api/conversations?token='+TOKEN);
+    if(!r.ok)return;
+    const convs=await r.json();
+    let newest=null;
+    convs.forEach(c=>{if(c.last.dir==='in'&&(!newest||c.last.time>newest))newest=c.last.time;});
+    if(lastIncoming&&newest&&newest>lastIncoming){beep();document.title='🔴 စာအသစ်! Staff Inbox';}
+    else if(lastIncoming){document.title='📥 Staff Inbox — Test Landing';}
+    if(newest)lastIncoming=newest;
+    render(convs);
+  }catch(e){}
+}
+setInterval(poll,5000);
+</script>
+"""
+
+_CHAT_JS = """
+<script>
+const _qs=new URLSearchParams(location.search);
+const TOKEN=_qs.get('token'),CH=_qs.get('channel'),US=_qs.get('user');
+const threadEl=document.getElementById('thread');
+const CNAME=threadEl.dataset.name||'';
+let lastSeq=parseInt(threadEl.dataset.last||'0');
+let soundOn=false, actx=null;
+function esc(s){const d=document.createElement('div');d.textContent=(s==null?'':s);return d.innerHTML}
+function toggleSound(){soundOn=!soundOn;if(soundOn){try{actx=new (window.AudioContext||window.webkitAudioContext)();actx.resume();}catch(e){}}document.getElementById('sndbtn').textContent=soundOn?'🔔 အသံ: ဖွင့်':'🔔 အသံ: ပိတ်';}
+function beep(){if(!soundOn||!actx)return;try{const o=actx.createOscillator(),g=actx.createGain();o.connect(g);g.connect(actx.destination);o.frequency.value=880;g.gain.setValueAtTime(0.08,actx.currentTime);o.start();o.stop(actx.currentTime+0.15);}catch(e){}}
+function bubble(r){
+  const out=r.dir==='out';
+  let cls=out?'out':'in';
+  if(out&&r.by==='staff')cls+=' staff';
+  const label=out?(r.by==='staff'?'🧑‍💼 Staff':'🤖 Bot'):CNAME;
+  let extra='';
+  if(r.media){extra=r.kind==='image'?"<br><img src='"+esc(r.media)+"' style='max-width:230px;border-radius:8px'>":"<br><a href='"+esc(r.media)+"' target='_blank'>📎 "+esc(r.fname||'ဖိုင်')+"</a>";}
+  return "<div class='row "+cls+"'><div class='msg "+cls+"'>"+esc(r.text)+extra+"<div class='t'>"+esc(label)+" · "+r.time+"</div></div></div>";
+}
+async function poll(){
+  try{
+    const r=await fetch('/inbox/api/thread?token='+TOKEN+'&channel='+CH+'&user='+encodeURIComponent(US)+'&after='+lastSeq);
+    if(!r.ok)return;
+    const msgs=await r.json();
+    if(!msgs.length)return;
+    const nearBottom=(window.innerHeight+window.scrollY)>(document.body.scrollHeight-300);
+    let newIn=false;
+    msgs.forEach(m=>{threadEl.insertAdjacentHTML('beforeend',bubble(m));if(m.seq>lastSeq)lastSeq=m.seq;if(m.dir==='in')newIn=true;});
+    if(newIn)beep();
+    if(nearBottom)window.scrollTo(0,document.body.scrollHeight);
+  }catch(e){}
+}
+setInterval(poll,4000);
+</script>
+"""
+
+
+@app.get("/inbox")
+def inbox_list():
+    token = request.args.get("token", "")
+    if not _staff_ok(token):
+        return "forbidden", 403
+    rows = ""
+    for c in _conv_summaries():
         last = c["last"]
         preview = html_lib.escape(last["text"][:150])
         who = "👤 " if last["dir"] == "in" else "🤖 "
         badge = ("fb'>Messenger" if c["channel"] == "messenger"
                  else "vb'>Viber")
         p = (" <span class='badge paused'>⏸ bot ရပ်ထား</span>"
-             if is_paused(c["channel"], c["user_id"]) else "")
+             if c["paused"] else "")
         rows += (
             f"<a class='conv' href='/inbox/chat?token={token}"
             f"&channel={c['channel']}&user={quote(c['user_id'], safe='')}'>"
             f"<div class='card'>"
-            f"<b>{html_lib.escape(user_name(c['channel'], c['user_id']))}</b>"
+            f"<b>{html_lib.escape(c['name'])}</b>"
             f" <span class='badge {badge}</span>{p}"
             f"<div class='t'>{last['time']} · {c['count']} messages</div>"
             f"<div>{who}{preview}</div>"
@@ -930,10 +1059,13 @@ def inbox_list():
         rows = "<div class='card'>စကားဝိုင်း မရှိသေးပါ</div>"
     body = (
         "<h2>📥 Staff Inbox — Test Landing</h2>"
-        f"<p><a href='/deposits?token={token}'>💰 ငွေသွင်း မှတ်တမ်း</a></p>"
-        + rows
+        f"<p><a href='/deposits?token={token}'>💰 ငွေသွင်း မှတ်တမ်း</a>"
+        " · အလိုအလျောက် update (၅ စက္ကန့်)</p>"
+        + _SOUND_BTN
+        + f"<div id='convs'>{rows}</div>"
+        + _LIST_JS
     )
-    return _page("Staff Inbox", body, refresh=True)
+    return _page("Staff Inbox", body)
 
 
 @app.get("/inbox/chat")
@@ -984,7 +1116,11 @@ def inbox_chat():
         f"({'Messenger' if channel == 'messenger' else 'Viber'})</h3>"
         f"{'<p style=\"color:#c0392b\">⚠️ <b>ပို့လို့ မရလိုက်ပါ</b> — customer က bot ကို ပိတ်ထား/subscribe မလုပ်ထားတာ ဖြစ်နိုင်ပါတယ်။</p>' if request.args.get('err') else ''}"
         f"{'<p>⏸ <b>Bot ရပ်ထားသည်</b> — ဝန်ထမ်း ပြောနေချိန် bot က ပြန်မဖြေပါ</p>' if paused else ''}"
-        f"{bubbles or '<p>စာ မရှိသေးပါ</p>'}"
+        + _SOUND_BTN
+        + f"<div id='thread' data-last='{msgs[-1].get('seq', 0) if msgs else 0}' "
+          f"data-name='{html_lib.escape(name)}'>"
+        + (bubbles or '<p>စာ မရှိသေးပါ</p>')
+        + "</div>"
         f"<div class='replybar'>"
         f"<form method='post' action='/inbox/reply' enctype='multipart/form-data'>"
         f"<input type='hidden' name='token' value='{token}'>"
@@ -995,7 +1131,8 @@ def inbox_chat():
         f"<p><button type='submit'>📤 ပို့မယ်</button></p></form>"
         f"{pbtn}"
         f"</div>"
-        f"<p><a href='/inbox/chat?token={token}&channel={channel}&user={quote(user_id, safe='')}'>↻ Refresh</a></p>"
+        f"<p><a href='/inbox/chat?token={token}&channel={channel}&user={quote(user_id, safe='')}'>↻ Refresh</a> · အလိုအလျောက် update (၄ စက္ကန့်)</p>"
+        + _CHAT_JS
     )
     return _page(f"Chat — {name}", body)
 
