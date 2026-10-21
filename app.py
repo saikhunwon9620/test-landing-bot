@@ -30,6 +30,7 @@ Environment variables:
 import glob
 import hashlib
 import hmac
+import html as html_lib
 import json
 import logging
 import os
@@ -38,7 +39,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 import requests
-from flask import Flask, request
+from flask import Flask, redirect, request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("test-landing-bot")
@@ -79,6 +80,9 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 STATE_FILE = os.path.join(DATA_DIR, "deposit_state.json")
 TXN_FILE = os.path.join(DATA_DIR, "transactions.jsonl")
 VIBER_STATE_FILE = os.path.join(DATA_DIR, "viber_deposit_state.json")
+INBOX_FILE = os.path.join(DATA_DIR, "inbox.jsonl")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+PAUSED_FILE = os.path.join(DATA_DIR, "paused.json")
 
 
 def load_knowledge() -> str:
@@ -129,7 +133,118 @@ def generate_reply(psid: str, text: str) -> str:
     return reply
 
 
-def send_to_messenger(psid: str, text: str) -> None:
+# --------------------------------------------------------------------------
+# Staff inbox storage — every conversation (both channels) is appended to
+# inbox.jsonl; users.json caches display names; paused.json holds the
+# "channel:user_id" keys where a human has taken over and the bot must
+# stay silent. All ephemeral like the deposit data (cleared on redeploy).
+# --------------------------------------------------------------------------
+
+def _read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, data) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        log.exception("could not write %s", path)
+
+
+def log_message(channel, user_id, direction, text, by="bot", kind="text",
+                name=None) -> None:
+    rec = {
+        "channel": channel, "user_id": user_id, "dir": direction,
+        "text": text, "by": by, "kind": kind,
+        "time": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(INBOX_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        log.exception("could not log inbox message")
+    if name:
+        remember_user(channel, user_id, name)
+
+
+def remember_user(channel, user_id, name) -> None:
+    users = _read_json(USERS_FILE, {})
+    key = f"{channel}:{user_id}"
+    u = users.get(key, {"channel": channel, "user_id": user_id})
+    u["name"] = name
+    u["last_seen"] = datetime.now().isoformat(timespec="seconds")
+    users[key] = u
+    _write_json(USERS_FILE, users)
+
+
+def user_name(channel, user_id) -> str:
+    users = _read_json(USERS_FILE, {})
+    u = users.get(f"{channel}:{user_id}") or {}
+    if u.get("name"):
+        return u["name"]
+    if channel == "messenger":
+        return messenger_name(user_id)
+    return f"Viber user •••{user_id[-6:]}" if len(user_id) > 6 else user_id
+
+
+def messenger_name(psid: str) -> str:
+    """Best-effort display name for a Messenger user (Graph profile API)."""
+    users = _read_json(USERS_FILE, {})
+    key = f"messenger:{psid}"
+    if users.get(key, {}).get("name"):
+        return users[key]["name"]
+    name = None
+    try:
+        r = requests.get(
+            f"https://graph.facebook.com/v21.0/{psid}",
+            params={"fields": "name", "access_token": PAGE_TOKEN},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            name = r.json().get("name")
+    except requests.RequestException:
+        pass
+    name = name or f"FB user •••{psid[-6:]}"
+    remember_user("messenger", psid, name)
+    return name
+
+
+def is_paused(channel, user_id) -> bool:
+    return f"{channel}:{user_id}" in set(_read_json(PAUSED_FILE, []))
+
+
+def set_paused(channel, user_id, on: bool) -> None:
+    s = set(_read_json(PAUSED_FILE, []))
+    key = f"{channel}:{user_id}"
+    if on:
+        s.add(key)
+    else:
+        s.discard(key)
+    _write_json(PAUSED_FILE, sorted(s))
+
+
+def _read_inbox(limit=1000):
+    items = []
+    try:
+        with open(INBOX_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    items.append(json.loads(line))
+    except FileNotFoundError:
+        pass
+    return items[-limit:]
+
+
+def _post_messenger(psid: str, text: str) -> bool:
+    """Raw Messenger send (typing indicator + text). True on success."""
     payloads = [
         {"sender_action": "typing_on"},
         {"message": {"text": text[:2000]}},
@@ -144,10 +259,16 @@ def send_to_messenger(psid: str, text: str) -> None:
             )
         except requests.RequestException:
             log.exception("send request failed")
-            return
+            return False
         if r.status_code != 200:
             log.error("send failed %s: %s", r.status_code, r.text[:300])
-            return
+            return False
+    return True
+
+
+def send_to_messenger(psid: str, text: str) -> None:
+    if _post_messenger(psid, text):
+        log_message("messenger", psid, "out", text, by="bot")
 
 
 def _fb_send(psid: str, text: str, keyboard=None) -> None:
@@ -421,7 +542,7 @@ def _viber_save_state(state: dict) -> None:
         log.exception("could not save viber deposit state")
 
 
-def viber_send(user_id: str, text: str, keyboard=None) -> None:
+def viber_send(user_id: str, text: str, keyboard=None, by="bot") -> None:
     if not VIBER_TOKEN:
         log.error("VIBER_AUTH_TOKEN not set; cannot send Viber message")
         return
@@ -443,6 +564,8 @@ def viber_send(user_id: str, text: str, keyboard=None) -> None:
         )
         if r.status_code != 200:
             log.error("viber send failed %s: %s", r.status_code, r.text[:300])
+        else:
+            log_message("viber", user_id, "out", text, by=by)
     except requests.RequestException:
         log.exception("viber send request failed")
 
@@ -492,6 +615,9 @@ def handle_event(ev: dict) -> None:
     state = _load_state()
     attachments = msg.get("attachments") or []
     if any(a.get("type") == "image" for a in attachments):
+        log_message("messenger", psid, "in", "(ပုံ)", kind="image")
+        if is_paused("messenger", psid):
+            return  # staff is handling this customer; stay silent
         handle_image(psid, state)
         return
     if "text" not in msg:
@@ -499,6 +625,9 @@ def handle_event(ev: dict) -> None:
 
     text = msg["text"].strip()
     log.info("incoming from %s: %s", psid, text[:120])
+    log_message("messenger", psid, "in", text)
+    if is_paused("messenger", psid):
+        return  # staff is handling this customer; stay silent
     if handle_deposit_text(psid, text, state):
         return
     try:
@@ -564,7 +693,10 @@ def viber_webhook():
 
     if etype == "conversation_started":
         # Returning a message object sends it as the welcome message.
-        user_id = (event.get("user") or {}).get("id", "")
+        user = event.get("user") or {}
+        user_id = user.get("id", "")
+        if user_id and user.get("name"):
+            remember_user("viber", user_id, user["name"])
         return {
             "receiver": user_id,
             "min_api_version": 7,
@@ -580,14 +712,21 @@ def viber_webhook():
         if token:
             seen_mids.append(f"viber:{token}")
         sender = (event.get("sender") or {}).get("id")
+        sname = (event.get("sender") or {}).get("name")
         msg = event.get("message") or {}
         if sender:
             if msg.get("type") == "picture":
-                viber_deposit_image(sender)
+                log_message("viber", sender, "in", "(ပုံ)", kind="image",
+                            name=sname)
+                if not is_paused("viber", sender):
+                    viber_deposit_image(sender)
             elif msg.get("type") == "text":
                 text = (msg.get("text") or "").strip()
                 if text:
                     log.info("viber incoming from %s: %s", sender, text[:120])
+                    log_message("viber", sender, "in", text, name=sname)
+                    if is_paused("viber", sender):
+                        return "ok", 200  # staff is handling; stay silent
                     if not viber_deposit_text(sender, text):
                         try:
                             reply = generate_reply(f"viber:{sender}", text)
@@ -628,6 +767,163 @@ def viber_setup():
         return "request to Viber failed", 502
 
 
+# --------------------------------------------------------------------------
+# Staff inbox web UI — token-gated pages to read customer conversations
+# (Messenger + Viber in one place), reply as a human, and pause the bot
+# per customer while staff are handling them.
+# --------------------------------------------------------------------------
+
+def _staff_ok(token) -> bool:
+    return bool(token) and token == os.environ.get("ADMIN_TOKEN", VERIFY_TOKEN)
+
+
+_INBOX_CSS = """
+body{font-family:sans-serif;max-width:760px;margin:0 auto;padding:12px;background:#f5f5f7}
+a{color:#7b2ff7;text-decoration:none}
+.card{background:#fff;border-radius:10px;padding:12px 14px;margin:8px 0;box-shadow:0 1px 3px #0001}
+.badge{font-size:11px;padding:2px 8px;border-radius:8px;color:#fff}
+.fb{background:#1877f2}.vb{background:#7360f2}.paused{background:#e67e22}
+.msg{max-width:85%;padding:8px 12px;border-radius:14px;margin:6px 0;white-space:pre-wrap;word-break:break-word}
+.in{background:#fff;box-shadow:0 1px 2px #0001}
+.out{background:#dcf8c6;margin-left:auto}
+.staff{background:#ffe9a8}
+.t{font-size:11px;color:#888;margin-top:2px}
+.row{display:flex;gap:8px;align-items:flex-start}.row.out{justify-content:flex-end}
+textarea{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #ccc}
+button{background:#7b2ff7;color:#fff;border:0;padding:10px 18px;border-radius:8px;font-size:15px}
+button.alt{background:#888}
+"""
+
+
+def _page(title, body, refresh=False):
+    meta = '<meta http-equiv="refresh" content="30">' if refresh else ""
+    return (
+        f"<!doctype html><html><head><meta charset='utf-8'>"
+        f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"{meta}<title>{html_lib.escape(title)}</title>"
+        f"<style>{_INBOX_CSS}</style></head><body>{body}</body></html>"
+    )
+
+
+@app.get("/inbox")
+def inbox_list():
+    token = request.args.get("token", "")
+    if not _staff_ok(token):
+        return "forbidden", 403
+    convs = {}
+    for rec in _read_inbox():
+        key = f"{rec['channel']}:{rec['user_id']}"
+        c = convs.setdefault(key, {"channel": rec["channel"],
+                                   "user_id": rec["user_id"], "count": 0})
+        c["last"] = rec
+        c["count"] += 1
+    ordered = sorted(convs.values(),
+                     key=lambda c: c["last"]["time"], reverse=True)
+    rows = ""
+    for c in ordered:
+        last = c["last"]
+        preview = html_lib.escape(last["text"][:80])
+        who = "👤 " if last["dir"] == "in" else "🤖 "
+        badge = ("fb'>Messenger" if c["channel"] == "messenger"
+                 else "vb'>Viber")
+        p = (" <span class='badge paused'>⏸ bot ရပ်ထား</span>"
+             if is_paused(c["channel"], c["user_id"]) else "")
+        rows += (
+            f"<div class='card'><a href='/inbox/chat?token={token}"
+            f"&channel={c['channel']}&user={c['user_id']}'>"
+            f"<b>{html_lib.escape(user_name(c['channel'], c['user_id']))}</b></a>"
+            f" <span class='badge {badge}</span>{p}"
+            f"<div class='t'>{last['time']} · {c['count']} messages</div>"
+            f"<div>{who}{preview}</div></div>"
+        )
+    if not rows:
+        rows = "<div class='card'>စကားဝိုင်း မရှိသေးပါ</div>"
+    body = (
+        "<h2>📥 Staff Inbox — Test Landing</h2>"
+        f"<p><a href='/deposits?token={token}'>💰 ငွေသွင်း မှတ်တမ်း</a></p>"
+        + rows
+    )
+    return _page("Staff Inbox", body, refresh=True)
+
+
+@app.get("/inbox/chat")
+def inbox_chat():
+    token = request.args.get("token", "")
+    if not _staff_ok(token):
+        return "forbidden", 403
+    channel = request.args.get("channel", "")
+    user_id = request.args.get("user", "")
+    name = user_name(channel, user_id)
+    msgs = [r for r in _read_inbox()
+            if r["channel"] == channel and r["user_id"] == user_id][-100:]
+    bubbles = ""
+    for r in msgs:
+        cls = "in" if r["dir"] == "in" else "out"
+        if r["dir"] == "out" and r.get("by") == "staff":
+            cls += " staff"
+        by = {"bot": "🤖 Bot", "staff": "🧑‍💼 Staff"}.get(r.get("by"), "")
+        label = name if r["dir"] == "in" else by
+        bubbles += (
+            f"<div class='row {cls}'><div class='msg {cls}'>"
+            f"{html_lib.escape(r['text'])}"
+            f"<div class='t'>{html_lib.escape(label)} · {r['time']}</div>"
+            f"</div></div>"
+        )
+    paused = is_paused(channel, user_id)
+    pbtn = (
+        f"<form method='post' action='/inbox/pause' style='display:inline'>"
+        f"<input type='hidden' name='token' value='{token}'>"
+        f"<input type='hidden' name='channel' value='{channel}'>"
+        f"<input type='hidden' name='user' value='{user_id}'>"
+        f"<input type='hidden' name='on' value='{'0' if paused else '1'}'>"
+        f"<button class='alt' type='submit'>"
+        f"{'▶️ Bot ပြန်ဖွင့်' if paused else '⏸ Bot ခဏရပ် (လူ ဝင်ပြောမယ်)'}</button></form>"
+    )
+    body = (
+        f"<p><a href='/inbox?token={token}'>← Inbox</a></p>"
+        f"<h3>{html_lib.escape(name)} "
+        f"({'Messenger' if channel == 'messenger' else 'Viber'})</h3>"
+        f"{'<p>⏸ <b>Bot ရပ်ထားသည်</b> — ဝန်ထမ်း ပြောနေချိန် bot က ပြန်မဖြေပါ</p>' if paused else ''}"
+        f"{bubbles or '<p>စာ မရှိသေးပါ</p>'}"
+        f"<form method='post' action='/inbox/reply'>"
+        f"<input type='hidden' name='token' value='{token}'>"
+        f"<input type='hidden' name='channel' value='{channel}'>"
+        f"<input type='hidden' name='user' value='{user_id}'>"
+        f"<textarea name='text' rows='3' placeholder='ပြန်စာ ရေးပါ...'></textarea>"
+        f"<p><button type='submit'>📤 ပို့မယ်</button> {pbtn}</p></form>"
+        f"<p><a href='/inbox/chat?token={token}&channel={channel}&user={user_id}'>↻ Refresh</a></p>"
+    )
+    return _page(f"Chat — {name}", body)
+
+
+@app.post("/inbox/reply")
+def inbox_reply():
+    token = request.form.get("token", "")
+    if not _staff_ok(token):
+        return "forbidden", 403
+    channel = request.form.get("channel", "")
+    user_id = request.form.get("user", "")
+    text = (request.form.get("text") or "").strip()
+    if channel and user_id and text:
+        if channel == "viber":
+            viber_send(user_id, text, by="staff")
+        elif _post_messenger(user_id, text):
+            log_message("messenger", user_id, "out", text, by="staff")
+    return redirect(f"/inbox/chat?token={token}&channel={channel}&user={user_id}")
+
+
+@app.post("/inbox/pause")
+def inbox_pause():
+    token = request.form.get("token", "")
+    if not _staff_ok(token):
+        return "forbidden", 403
+    channel = request.form.get("channel", "")
+    user_id = request.form.get("user", "")
+    if channel and user_id:
+        set_paused(channel, user_id, request.form.get("on") == "1")
+    return redirect(f"/inbox/chat?token={token}&channel={channel}&user={user_id}")
+
+
 @app.get("/health")
 def health():
     return "ok", 200
@@ -635,4 +931,3 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-
