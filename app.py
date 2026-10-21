@@ -20,10 +20,16 @@ Environment variables:
   KPAY_NUMBER         - KPay account shown to customers (default below)
   WAVEPAY_NUMBER      - Wave Pay account shown to customers (default below)
   ADMIN_TOKEN         - token for GET /deposits (default: VERIFY_TOKEN)
+  VIBER_AUTH_TOKEN    - Viber bot auth token from admin.viber.com (optional;
+                        the Viber channel stays off until this is set)
+  VIBER_BOT_NAME      - display name used when sending Viber messages
+  PUBLIC_BASE_URL     - public base URL of this service (for webhook setup)
   PORT                - listen port (default: 8000)
 """
 
 import glob
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -44,6 +50,12 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 KPAY_NUMBER = os.environ.get("KPAY_NUMBER", "09777888999")
 WAVEPAY_NUMBER = os.environ.get("WAVEPAY_NUMBER", "09946946294")
 MIN_DEPOSIT = 10000  # kyats; business rule from the FAQ (2026-10-20)
+VIBER_TOKEN = os.environ.get("VIBER_AUTH_TOKEN", "")
+VIBER_BOT_NAME = os.environ.get("VIBER_BOT_NAME", "Test Landing")
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL", "https://test-landing-bot-production-b590.up.railway.app"
+).rstrip("/")
+VIBER_API = "https://chatapi.viber.com/pa"
 
 app = Flask(__name__)
 
@@ -66,6 +78,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 STATE_FILE = os.path.join(DATA_DIR, "deposit_state.json")
 TXN_FILE = os.path.join(DATA_DIR, "transactions.jsonl")
+VIBER_STATE_FILE = os.path.join(DATA_DIR, "viber_deposit_state.json")
 
 
 def load_knowledge() -> str:
@@ -135,6 +148,12 @@ def send_to_messenger(psid: str, text: str) -> None:
         if r.status_code != 200:
             log.error("send failed %s: %s", r.status_code, r.text[:300])
             return
+
+
+def _fb_send(psid: str, text: str, keyboard=None) -> None:
+    """Messenger adapter matching the shared flow's send() signature
+    (Messenger has no custom keyboards here, so `keyboard` is ignored)."""
+    send_to_messenger(psid, text)
 
 
 # --------------------------------------------------------------------------
@@ -229,13 +248,13 @@ def detect_pay_type(text: str):
     return None
 
 
-def send_payment_details(psid: str, ptype: str, state: dict) -> bool:
+def send_payment_details(psid, ptype, state, send, save) -> bool:
     """Send the chosen method's account details as text; wait for the slip."""
     info = PAYMENT_TYPES[ptype]
     state[psid] = {"step": "slip", "pay_type": ptype}
-    _save_state(state)
+    save(state)
     name_line = f" ({info['name']})" if info.get("name") else ""
-    send_to_messenger(
+    send(
         psid,
         f"{info['label']} အကောင့်: {info['number']}{name_line}\n"
         "ငွေလွှဲပြီးရင် slip ပုံကို ဒီမှာ ပြန်ပို့ပေးပါနော် 📸",
@@ -243,13 +262,14 @@ def send_payment_details(psid: str, ptype: str, state: dict) -> bool:
     return True
 
 
-def _complete_deposit(psid: str, state: dict) -> bool:
+def _complete_deposit(psid, state, send, save, channel="messenger") -> bool:
     st = state.pop(psid, {})
-    _save_state(state)
+    save(state)
     amount = st.get("amount") or 0
     _log_txn(
         {
             "psid": psid,
+            "channel": channel,
             "amount": amount,
             "units": amount // 1000 if amount else None,
             "pay_type": st.get("pay_type"),
@@ -257,7 +277,7 @@ def _complete_deposit(psid: str, state: dict) -> bool:
             "slip": True,
         }
     )
-    send_to_messenger(
+    send(
         psid,
         f"✅ Slip လက်ခံရရှိပါပြီ! {amount:,} ကျပ် ({amount // 1000} ယူနစ်) ကို "
         "ဝန်ထမ်းက စစ်ဆေးပြီး မကြာခင် အကောင့်ထဲ ထည့်ပေးပါမယ်။ "
@@ -266,34 +286,35 @@ def _complete_deposit(psid: str, state: dict) -> bool:
     return True
 
 
-def _check_amount(psid: str, text: str, state: dict):
+def _check_amount(psid, text, state, send, save, channel="messenger"):
     """Validate an amount reply. Returns True/False if handled, None if invalid."""
     st = state[psid]
     amount = parse_amount(text)
     if amount is None:
-        send_to_messenger(psid, "ပမာဏကို နံပါတ်နဲ့ ပို့ပေးပါနော် (ဥပမာ 10000) 🙏")
+        send(psid, "ပမာဏကို နံပါတ်နဲ့ ပို့ပေးပါနော် (ဥပမာ 10000) 🙏")
         return True
     if amount < MIN_DEPOSIT:
-        send_to_messenger(
+        send(
             psid,
             "အနည်းဆုံး ၁၀,၀၀၀ ကျပ်ကနေ စသွင်းလို့ရပါတယ်ရှင့်။ "
             "ပမာဏ ပြန်ပို့ပေးပါနော် 🙏",
         )
         return True
     if amount % 1000 != 0:
-        send_to_messenger(
+        send(
             psid,
             "ယူနစ်က ၁ ယူနစ် = ၁၀၀၀ ကျပ် နှုန်းမို့ ၁၀၀၀ နဲ့ စားလို့ပြတ်တဲ့ "
             "ပမာဏလေး ပြန်ပို့ပေးပါနော် (ဥပမာ 10000, 20000) 🙏",
         )
         return True
     st["amount"] = amount
-    _save_state(state)
-    return _complete_deposit(psid, state)
+    save(state)
+    return _complete_deposit(psid, state, send, save, channel)
 
 
-def handle_deposit_text(psid: str, text: str, state: dict) -> bool:
-    """Drive the deposit state machine for a text message.
+def handle_deposit_text(psid, text, state, send=_fb_send, save=_save_state,
+                        channel="messenger", paytype_keyboard=None) -> bool:
+    """Drive the deposit state machine for a text message (any channel).
 
     Returns True when the message was consumed by the flow."""
     st = state.get(psid)
@@ -301,8 +322,8 @@ def handle_deposit_text(psid: str, text: str, state: dict) -> bool:
 
     if st and ("cancel" in low or "မလုပ်တော့" in text or "ရပ်မယ်" in text):
         state.pop(psid, None)
-        _save_state(state)
-        send_to_messenger(
+        save(state)
+        send(
             psid,
             "ရပါတယ်နော်၊ ငွေသွင်းတာ ရပ်လိုက်ပါပြီ။ "
             "တခြား သိချင်တာ ရှိရင် မေးလို့ရပါတယ် 😊",
@@ -314,14 +335,15 @@ def handle_deposit_text(psid: str, text: str, state: dict) -> bool:
     if not st:
         if wants_deposit(text):
             if ptype:  # e.g. "KPay နဲ့ ငွေသွင်းချင်တယ်" — type already known
-                return send_payment_details(psid, ptype, state)
+                return send_payment_details(psid, ptype, state, send, save)
             state[psid] = {"step": "paytype"}
-            _save_state(state)
-            send_to_messenger(
+            save(state)
+            send(
                 psid,
                 "ဘယ် payment အမျိုးအစားနဲ့ ငွေသွင်းချင်ပါသလဲရှင့်။ "
                 "KPay, Wave Pay စသည့် ငွေပေးချေမှု အမျိုးအစားတွေနဲ့ "
                 "ပေးသွင်းနိုင်ပါတယ်။ အနည်းဆုံး ၁၀,၀၀၀ ကျပ်က စသွင်းနိုင်ပါတယ်။",
+                keyboard=paytype_keyboard,
             )
             return True
         return False
@@ -329,16 +351,17 @@ def handle_deposit_text(psid: str, text: str, state: dict) -> bool:
     step = st.get("step")
     if step == "paytype":
         if ptype:
-            return send_payment_details(psid, ptype, state)
-        send_to_messenger(
+            return send_payment_details(psid, ptype, state, send, save)
+        send(
             psid,
             "ငွေသွင်းဖို့ KPay လား, Wave Pay လား ရွေးပေးပါနော် 🙏 "
             "(မသွင်းတော့ဘူးဆိုရင် 'cancel' လို့ ပို့လို့ရပါတယ်)",
+            keyboard=paytype_keyboard,
         )
         return True
 
     if step == "slip":
-        send_to_messenger(
+        send(
             psid,
             "လွှဲပြီးရင် slip ပုံကို ပို့ပေးပါနော် 📸 "
             "(မသွင်းတော့ဘူးဆိုရင် 'cancel' လို့ ပို့လို့ရပါတယ်)",
@@ -346,12 +369,12 @@ def handle_deposit_text(psid: str, text: str, state: dict) -> bool:
         return True
 
     if step == "amount":  # slip already received; waiting for the amount
-        return _check_amount(psid, text, state)
+        return _check_amount(psid, text, state, send, save, channel)
 
     return False
 
 
-def handle_image(psid: str, state: dict) -> None:
+def handle_image(psid, state, send=_fb_send, save=_save_state) -> None:
     """A customer image is treated as a payment slip."""
     st = state.get(psid)
     if st and st.get("step") == "amount":
@@ -361,11 +384,93 @@ def handle_image(psid: str, state: dict) -> None:
     else:
         # Flow in progress (paytype/slip step): remember the slip, ask amount.
         state[psid] = {**st, "step": "amount", "slip": True}
-    _save_state(state)
-    send_to_messenger(
+    save(state)
+    send(
         psid,
         "Slip ပုံ လက်ခံရရှိပါပြီ 📸 သွင်းခဲ့တဲ့ ပမာဏလေးကို "
         "နံပါတ်နဲ့ ပို့ပေးပါနော် (ဥပမာ 10000)",
+    )
+
+
+# --------------------------------------------------------------------------
+# Viber channel — same brain (Gemini + knowledge base) and the same deposit
+# flow, different transport. Active only when VIBER_AUTH_TOKEN is set.
+# --------------------------------------------------------------------------
+
+WELCOME_TEXT = (
+    "မင်္ဂလာပါရှင့်။ Test Landing ကနေ ကြိုဆိုပါတယ်။ "
+    "ဘောလုံး၊ ကာစီနိုတွေ ကစားဖို့အတွက် ဘာများ ဝန်ဆောင်မှုပေးရမလဲရှင့်။ "
+    "သိချင်တာလေး မေးလို့ရပါတယ် 🙏"
+)
+
+
+def _viber_load_state() -> dict:
+    try:
+        with open(VIBER_STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _viber_save_state(state: dict) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(VIBER_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception:
+        log.exception("could not save viber deposit state")
+
+
+def viber_send(user_id: str, text: str, keyboard=None) -> None:
+    if not VIBER_TOKEN:
+        log.error("VIBER_AUTH_TOKEN not set; cannot send Viber message")
+        return
+    payload = {
+        "receiver": user_id,
+        "min_api_version": 7,
+        "sender": {"name": VIBER_BOT_NAME},
+        "type": "text",
+        "text": text[:6000],
+    }
+    if keyboard:
+        payload["keyboard"] = keyboard
+    try:
+        r = requests.post(
+            f"{VIBER_API}/send_message",
+            headers={"X-Viber-Auth-Token": VIBER_TOKEN},
+            json=payload,
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.error("viber send failed %s: %s", r.status_code, r.text[:300])
+    except requests.RequestException:
+        log.exception("viber send request failed")
+
+
+def _paytype_keyboard() -> dict:
+    return {
+        "Type": "keyboard",
+        "DefaultHeight": True,
+        "Buttons": [
+            {"Columns": 3, "Rows": 1, "Text": "KPay",
+             "ActionType": "reply", "ActionBody": "KPay"},
+            {"Columns": 3, "Rows": 1, "Text": "Wave Pay",
+             "ActionType": "reply", "ActionBody": "Wave Pay"},
+        ],
+    }
+
+
+def viber_deposit_text(user_id: str, text: str) -> bool:
+    return handle_deposit_text(
+        user_id, text, _viber_load_state(),
+        send=viber_send, save=_viber_save_state,
+        channel="viber", paytype_keyboard=_paytype_keyboard(),
+    )
+
+
+def viber_deposit_image(user_id: str) -> None:
+    handle_image(
+        user_id, _viber_load_state(), send=viber_send, save=_viber_save_state
     )
 
 
@@ -442,6 +547,85 @@ def deposits():
     except FileNotFoundError:
         pass
     return {"count": len(items), "deposits": items[-50:]}, 200
+
+
+@app.post("/viber/webhook")
+def viber_webhook():
+    """Viber bot events. Signature: HMAC-SHA256 of the raw body, keyed with
+    the bot auth token, sent as X-Viber-Content-Signature."""
+    raw = request.get_data()
+    if VIBER_TOKEN:
+        sig = request.headers.get("X-Viber-Content-Signature", "")
+        expected = hmac.new(VIBER_TOKEN.encode(), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return "bad signature", 403
+    event = request.get_json(silent=True) or {}
+    etype = event.get("event")
+
+    if etype == "conversation_started":
+        # Returning a message object sends it as the welcome message.
+        user_id = (event.get("user") or {}).get("id", "")
+        return {
+            "receiver": user_id,
+            "min_api_version": 7,
+            "sender": {"name": VIBER_BOT_NAME},
+            "type": "text",
+            "text": WELCOME_TEXT,
+        }, 200
+
+    if etype == "message":
+        token = event.get("message_token")
+        if token and f"viber:{token}" in seen_mids:
+            return "ok", 200  # Viber retried this event; already replied
+        if token:
+            seen_mids.append(f"viber:{token}")
+        sender = (event.get("sender") or {}).get("id")
+        msg = event.get("message") or {}
+        if sender:
+            if msg.get("type") == "picture":
+                viber_deposit_image(sender)
+            elif msg.get("type") == "text":
+                text = (msg.get("text") or "").strip()
+                if text:
+                    log.info("viber incoming from %s: %s", sender, text[:120])
+                    if not viber_deposit_text(sender, text):
+                        try:
+                            reply = generate_reply(f"viber:{sender}", text)
+                        except Exception:
+                            log.exception("AI generation failed")
+                            reply = "ခဏလေးစောင့်ပေးပါနော်၊ လူသားဝန်ထမ်းနဲ့ ဆက်သွယ်ပေးပါမယ်။"
+                        viber_send(sender, reply)
+    return "ok", 200
+
+
+@app.get("/viber/setup")
+def viber_setup():
+    """One-time: register this service's webhook URL with Viber.
+    Open /viber/setup?token=<ADMIN_TOKEN> in a browser after deploying."""
+    token = os.environ.get("ADMIN_TOKEN", VERIFY_TOKEN)
+    if request.args.get("token") != token:
+        return "forbidden", 403
+    if not VIBER_TOKEN:
+        return "VIBER_AUTH_TOKEN is not set on the server", 400
+    try:
+        r = requests.post(
+            f"{VIBER_API}/set_webhook",
+            headers={"X-Viber-Auth-Token": VIBER_TOKEN},
+            json={
+                "url": f"{PUBLIC_BASE_URL}/viber/webhook",
+                "event_types": [
+                    "message", "conversation_started", "subscribed",
+                    "unsubscribed", "delivered", "seen", "failed",
+                ],
+                "send_name": True,
+                "send_photo": True,
+            },
+            timeout=15,
+        )
+        return r.text, r.status_code
+    except requests.RequestException:
+        log.exception("viber set_webhook failed")
+        return "request to Viber failed", 502
 
 
 @app.get("/health")
