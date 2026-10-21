@@ -789,6 +789,8 @@ a{color:#7b2ff7;text-decoration:none}
 .staff{background:#ffe9a8}
 .t{font-size:11px;color:#888;margin-top:2px}
 .row{display:flex;gap:8px;align-items:flex-start}.row.out{justify-content:flex-end}
+a.conv{display:block;color:inherit}
+.replybar{position:sticky;bottom:0;background:#f5f5f7;padding:10px 0}
 textarea{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #ccc}
 button{background:#7b2ff7;color:#fff;border:0;padding:10px 18px;border-radius:8px;font-size:15px}
 button.alt{background:#888}
@@ -822,19 +824,22 @@ def inbox_list():
     rows = ""
     for c in ordered:
         last = c["last"]
-        preview = html_lib.escape(last["text"][:80])
+        preview = html_lib.escape(last["text"][:150])
         who = "👤 " if last["dir"] == "in" else "🤖 "
         badge = ("fb'>Messenger" if c["channel"] == "messenger"
                  else "vb'>Viber")
         p = (" <span class='badge paused'>⏸ bot ရပ်ထား</span>"
              if is_paused(c["channel"], c["user_id"]) else "")
         rows += (
-            f"<div class='card'><a href='/inbox/chat?token={token}"
+            f"<a class='conv' href='/inbox/chat?token={token}"
             f"&channel={c['channel']}&user={c['user_id']}'>"
-            f"<b>{html_lib.escape(user_name(c['channel'], c['user_id']))}</b></a>"
+            f"<div class='card'>"
+            f"<b>{html_lib.escape(user_name(c['channel'], c['user_id']))}</b>"
             f" <span class='badge {badge}</span>{p}"
             f"<div class='t'>{last['time']} · {c['count']} messages</div>"
-            f"<div>{who}{preview}</div></div>"
+            f"<div>{who}{preview}</div>"
+            f"<div class='t'>💬 နှိပ်ပြီး အပြည့်ဖတ် / ပြန်ရေးရန်</div>"
+            f"</div></a>"
         )
     if not rows:
         rows = "<div class='card'>စကားဝိုင်း မရှိသေးပါ</div>"
@@ -885,12 +890,15 @@ def inbox_chat():
         f"({'Messenger' if channel == 'messenger' else 'Viber'})</h3>"
         f"{'<p>⏸ <b>Bot ရပ်ထားသည်</b> — ဝန်ထမ်း ပြောနေချိန် bot က ပြန်မဖြေပါ</p>' if paused else ''}"
         f"{bubbles or '<p>စာ မရှိသေးပါ</p>'}"
+        f"<div class='replybar'>"
         f"<form method='post' action='/inbox/reply'>"
         f"<input type='hidden' name='token' value='{token}'>"
         f"<input type='hidden' name='channel' value='{channel}'>"
         f"<input type='hidden' name='user' value='{user_id}'>"
         f"<textarea name='text' rows='3' placeholder='ပြန်စာ ရေးပါ...'></textarea>"
-        f"<p><button type='submit'>📤 ပို့မယ်</button> {pbtn}</p></form>"
+        f"<p><button type='submit'>📤 ပို့မယ်</button></p></form>"
+        f"{pbtn}"
+        f"</div>"
         f"<p><a href='/inbox/chat?token={token}&channel={channel}&user={user_id}'>↻ Refresh</a></p>"
     )
     return _page(f"Chat — {name}", body)
