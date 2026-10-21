@@ -78,8 +78,10 @@ seen_mids: deque = deque(maxlen=500)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Deposit-flow state + transaction log live on disk (shared by all gunicorn
-# workers in this container). Ephemeral: cleared when the service redeploys.
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# workers in this container). Ephemeral: cleared when the service redeploys,
+# UNLESS DATA_DIR points at a mounted Railway Volume (persistent disk).
+DATA_DIR = os.environ.get(
+    "DATA_DIR", os.path.join(BASE_DIR, "data"))
 STATE_FILE = os.path.join(DATA_DIR, "deposit_state.json")
 TXN_FILE = os.path.join(DATA_DIR, "transactions.jsonl")
 VIBER_STATE_FILE = os.path.join(DATA_DIR, "viber_deposit_state.json")
