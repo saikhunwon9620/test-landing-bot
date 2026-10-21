@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import html as html_lib
 import json
+from urllib.parse import quote
 import logging
 import os
 import re
@@ -542,10 +543,13 @@ def _viber_save_state(state: dict) -> None:
         log.exception("could not save viber deposit state")
 
 
-def viber_send(user_id: str, text: str, keyboard=None, by="bot") -> None:
+def viber_send(user_id: str, text: str, keyboard=None, by="bot") -> bool:
+    """Send a Viber message. True only when Viber confirms delivery —
+    the API answers HTTP 200 with {"status": != 0} for failures such as
+    an unknown or unsubscribed receiver, so the body must be checked."""
     if not VIBER_TOKEN:
         log.error("VIBER_AUTH_TOKEN not set; cannot send Viber message")
-        return
+        return False
     payload = {
         "receiver": user_id,
         "min_api_version": 7,
@@ -562,12 +566,20 @@ def viber_send(user_id: str, text: str, keyboard=None, by="bot") -> None:
             json=payload,
             timeout=15,
         )
-        if r.status_code != 200:
-            log.error("viber send failed %s: %s", r.status_code, r.text[:300])
-        else:
-            log_message("viber", user_id, "out", text, by=by)
     except requests.RequestException:
         log.exception("viber send request failed")
+        return False
+    ok = False
+    if r.status_code == 200:
+        try:
+            ok = r.json().get("status") == 0
+        except ValueError:
+            ok = False
+    if ok:
+        log_message("viber", user_id, "out", text, by=by)
+    else:
+        log.error("viber send NOT delivered %s: %s", r.status_code, r.text[:300])
+    return ok
 
 
 def _paytype_keyboard() -> dict:
@@ -832,7 +844,7 @@ def inbox_list():
              if is_paused(c["channel"], c["user_id"]) else "")
         rows += (
             f"<a class='conv' href='/inbox/chat?token={token}"
-            f"&channel={c['channel']}&user={c['user_id']}'>"
+            f"&channel={c['channel']}&user={quote(c['user_id'], safe='')}'>"
             f"<div class='card'>"
             f"<b>{html_lib.escape(user_name(c['channel'], c['user_id']))}</b>"
             f" <span class='badge {badge}</span>{p}"
@@ -888,6 +900,7 @@ def inbox_chat():
         f"<p><a href='/inbox?token={token}'>← Inbox</a></p>"
         f"<h3>{html_lib.escape(name)} "
         f"({'Messenger' if channel == 'messenger' else 'Viber'})</h3>"
+        f"{'<p style=\"color:#c0392b\">⚠️ <b>ပို့လို့ မရလိုက်ပါ</b> — customer က bot ကို ပိတ်ထား/subscribe မလုပ်ထားတာ ဖြစ်နိုင်ပါတယ်။</p>' if request.args.get('err') else ''}"
         f"{'<p>⏸ <b>Bot ရပ်ထားသည်</b> — ဝန်ထမ်း ပြောနေချိန် bot က ပြန်မဖြေပါ</p>' if paused else ''}"
         f"{bubbles or '<p>စာ မရှိသေးပါ</p>'}"
         f"<div class='replybar'>"
@@ -899,7 +912,7 @@ def inbox_chat():
         f"<p><button type='submit'>📤 ပို့မယ်</button></p></form>"
         f"{pbtn}"
         f"</div>"
-        f"<p><a href='/inbox/chat?token={token}&channel={channel}&user={user_id}'>↻ Refresh</a></p>"
+        f"<p><a href='/inbox/chat?token={token}&channel={channel}&user={quote(user_id, safe='')}'>↻ Refresh</a></p>"
     )
     return _page(f"Chat — {name}", body)
 
@@ -912,12 +925,18 @@ def inbox_reply():
     channel = request.form.get("channel", "")
     user_id = request.form.get("user", "")
     text = (request.form.get("text") or "").strip()
+    sent = False
     if channel and user_id and text:
         if channel == "viber":
-            viber_send(user_id, text, by="staff")
+            sent = viber_send(user_id, text, by="staff")
         elif _post_messenger(user_id, text):
             log_message("messenger", user_id, "out", text, by="staff")
-    return redirect(f"/inbox/chat?token={token}&channel={channel}&user={user_id}")
+            sent = True
+    back = (f"/inbox/chat?token={token}&channel={channel}"
+            f"&user={quote(user_id, safe='')}")
+    if text and not sent:
+        back += "&err=1"
+    return redirect(back)
 
 
 @app.post("/inbox/pause")
@@ -929,7 +948,8 @@ def inbox_pause():
     user_id = request.form.get("user", "")
     if channel and user_id:
         set_paused(channel, user_id, request.form.get("on") == "1")
-    return redirect(f"/inbox/chat?token={token}&channel={channel}&user={user_id}")
+    return redirect(f"/inbox/chat?token={token}&channel={channel}"
+                    f"&user={quote(user_id, safe='')}")
 
 
 @app.get("/health")
